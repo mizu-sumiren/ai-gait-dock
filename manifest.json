@@ -1,0 +1,15 @@
+{
+  "name": "AI歩行ドック",
+  "short_name": "歩行ドック",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#667eea",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3774/3774299.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
