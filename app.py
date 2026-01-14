@@ -33,10 +33,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# カスタムCSS（ピンク×白基調、清潔感のあるデザイン）
+# カスタムCSS
 st.markdown("""
 <style>
-    /* メインヘッダー */
     .main-header {
         font-size: 2.8rem;
         font-weight: bold;
@@ -56,7 +55,6 @@ st.markdown("""
         font-weight: 300;
     }
     
-    /* カード系 */
     .success-card {
         background: linear-gradient(135deg, #E8F5E9 0%, #F1F8E9 100%);
         border-left: 6px solid #4CAF50;
@@ -102,24 +100,20 @@ st.markdown("""
         box-shadow: 0 4px 12px rgba(0,0,0,0.08);
     }
     
-    /* プログレスバー */
     .stProgress > div > div > div > div {
         background: linear-gradient(90deg, #E91E63 0%, #F06292 100%);
     }
     
-    /* メトリクス */
     div[data-testid="stMetricValue"] {
         font-size: 2rem;
         font-weight: bold;
         color: #E91E63;
     }
     
-    /* サイドバー */
     section[data-testid="stSidebar"] {
         background: linear-gradient(180deg, #FCE4EC 0%, #F8BBD0 100%);
     }
     
-    /* ボタン */
     .stButton > button {
         background: linear-gradient(135deg, #E91E63 0%, #F06292 100%);
         color: white;
@@ -136,7 +130,6 @@ st.markdown("""
         box-shadow: 0 6px 16px rgba(233, 30, 99, 0.4);
     }
     
-    /* ファイルアップローダー */
     div[data-testid="stFileUploader"] {
         background-color: #FFF;
         border: 2px dashed #E91E63;
@@ -146,30 +139,31 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# === 画像前処理関数（CLAHE） ===
+# 画像前処理関数（CLAHE強化版）
 def enhance_frame_for_pose_detection(frame):
-    """
-    CLAHE（適応的ヒストグラム平滑化）によるコントラスト強化
-    白背景×白服でも骨格検出を可能にする
-    """
+    """CLAHE強化版：より強力なコントラスト強調"""
     try:
-        # RGB変換
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # LAB色空間に変換してLチャンネルにCLAHE適用
         lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
         l, a, b = cv2.split(lab)
         
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))
         l_enhanced = clahe.apply(l)
         
         lab_enhanced = cv2.merge([l_enhanced, a, b])
         enhanced_frame = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
         
-        # 軽いシャープニング
-        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        kernel = np.array([[0, -1, 0], [-1, 5.5, -1], [0, -1, 0]])
         sharpened = cv2.filter2D(enhanced_frame, -1, kernel)
-        enhanced_frame = cv2.addWeighted(enhanced_frame, 0.7, sharpened, 0.3, 0)
+        enhanced_frame = cv2.addWeighted(enhanced_frame, 0.6, sharpened, 0.4, 0)
+        
+        mean_brightness = np.mean(enhanced_frame)
+        if mean_brightness < 110:
+            gamma = 1.3
+            inv_gamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+            enhanced_frame = cv2.LUT(enhanced_frame, table)
         
         return enhanced_frame
     except:
@@ -231,7 +225,6 @@ if uploaded_file is not None:
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # 一時ファイルに保存
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
         tfile.write(uploaded_file.read())
         temp_video_path = tfile.name
@@ -251,11 +244,10 @@ if uploaded_file is not None:
             cap.release()
             st.stop()
         
-        # MediaPipe Pose初期化（Streamlit Cloud対応設定）
         with mp_pose.Pose(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
-            model_complexity=1,  # Streamlit Cloud対応
+            model_complexity=1,
             smooth_landmarks=True
         ) as pose:
             
@@ -263,7 +255,6 @@ if uploaded_file is not None:
             frame_count = 0
             detection_count = 0
             
-            # プレビュー表示
             col1, col2 = st.columns([2, 1])
             with col1:
                 st_frame = st.empty()
@@ -281,7 +272,6 @@ if uploaded_file is not None:
             while cap.isOpened():
                 ret, frame = cap.read()
                 
-                # フレーム存在チェック（二重確認）
                 if not ret or frame is None:
                     break
                 
@@ -293,17 +283,13 @@ if uploaded_file is not None:
                 progress_bar.progress(min(progress, 1.0))
                 
                 try:
-                    # CLAHE画像強化
                     frame_enhanced = enhance_frame_for_pose_detection(frame)
-                    
-                    # MediaPipe処理
                     results = pose.process(frame_enhanced)
                     
                     if results.pose_landmarks:
                         landmarks_history.append(results.pose_landmarks.landmark)
                         detection_count += 1
                         
-                        # ランドマーク描画
                         mp_drawing.draw_landmarks(
                             frame,
                             results.pose_landmarks,
@@ -329,7 +315,6 @@ if uploaded_file is not None:
                     
                     frame_info.metric("処理フレーム", f"{frame_count}/{total_frames}")
                     
-                    # 10フレームごとにリサイズ表示
                     if frame_count % DISPLAY_INTERVAL == 0:
                         height, width = frame.shape[:2]
                         if width > PREVIEW_WIDTH:
@@ -348,7 +333,6 @@ if uploaded_file is not None:
                 except:
                     continue
             
-            # 最終フレーム表示
             try:
                 if frame is not None and frame.size > 0:
                     height, width = frame.shape[:2]
@@ -366,7 +350,6 @@ if uploaded_file is not None:
             final_detection_rate = detection_count / total_frames if total_frames > 0 else 0
             status_text.success(f"✅ 処理完了: {len(landmarks_history)}フレーム検出（検出率: {final_detection_rate*100:.1f}%）")
             
-            # === 臨床分析の実行 ===
             if len(landmarks_history) >= 30:
                 st.markdown("---")
                 status_text.info("🧠 AI理学療法士が詳細分析中...")
@@ -380,21 +363,20 @@ if uploaded_file is not None:
                 else:
                     status_text.success("✨ 分析完了！")
                     
-                    # === 結果表示 ===
                     st.markdown("---")
                     st.markdown("## 🏥 AI理学療法士の臨床分析レポート")
                     
                     # リスクレベルバッジ
                     risk_level = clinical_res.get('risk_level', 'unknown')
                     risk_badges = {
-                        'low': ('🌟 優良', 'success-card'),
-                        'moderate': ('💚 良好', 'warning-card'),
-                        'high': ('🔔 改善推奨', 'danger-card')
+                        'critical': ('🚨 要専門家相談（Critical Risk）', 'danger-card'),
+                        'high': ('🔔 改善推奨（High Risk）', 'danger-card'),
+                        'moderate': ('💚 良好（Moderate）', 'warning-card'),
+                        'low': ('🌟 優良（Excellent）', 'success-card')
                     }
                     badge_text, card_class = risk_badges.get(risk_level, ('❓ 不明', 'info-card'))
                     st.markdown(f'<div class="{card_class}"><h2 style="margin:0;">{badge_text}</h2></div>', unsafe_allow_html=True)
                     
-                    # === メトリクス表示 ===
                     if clinical_res.get('analysis_type') == 'advanced':
                         st.markdown("### 📊 主要な臨床指標")
                         
@@ -418,13 +400,20 @@ if uploaded_file is not None:
                         
                         with col2:
                             consistency = knee_metrics['consistency']
+                            consistency_interp = knee_metrics.get('consistency_interpretation', {})
+                            
                             st.metric(
-                                "歩行の一貫性",
+                                "歩行リズムの安定度",
                                 f"±{consistency}°",
-                                "安定" if consistency < 5.0 else "ばらつきあり",
+                                consistency_interp.get('label', ''),
                                 delta_color="normal" if consistency < 5.0 else "inverse"
                             )
-                            st.caption("値が小さいほど安定")
+                            
+                            if consistency_interp:
+                                icon = consistency_interp.get('icon', '')
+                                st.markdown(f"### {icon}")
+                            
+                            st.caption("SD値が小さいほど安定")
                         
                         with col3:
                             if trunk_metrics and trunk_metrics['mean_trunk_angle'] is not None:
@@ -442,14 +431,13 @@ if uploaded_file is not None:
                         
                         st.info(f"🚶‍♀️ 検出された歩行周期: **{clinical_res['gait_cycles_detected']}周期**")
                         
-                        # === 歩行波形グラフ（Plotly） ===
+                        # 歩行波形グラフ（Y軸固定版）
                         st.markdown("### 📈 歩行パターンの可視化")
                         
                         raw_data = clinical_res.get('raw_data', {})
                         if raw_data:
                             fig = go.Figure()
                             
-                            # 生データ
                             fig.add_trace(go.Scatter(
                                 y=raw_data['knee_angles_series'],
                                 mode='lines',
@@ -458,7 +446,6 @@ if uploaded_file is not None:
                                 opacity=0.5
                             ))
                             
-                            # 平滑化データ
                             fig.add_trace(go.Scatter(
                                 y=raw_data['smoothed_angles'],
                                 mode='lines',
@@ -466,7 +453,6 @@ if uploaded_file is not None:
                                 line=dict(color='#E91E63', width=2)
                             ))
                             
-                            # ピーク（立脚期）
                             fig.add_trace(go.Scatter(
                                 x=raw_data['peaks'],
                                 y=[raw_data['smoothed_angles'][i] for i in raw_data['peaks']],
@@ -475,7 +461,6 @@ if uploaded_file is not None:
                                 marker=dict(color='green', size=10, symbol='star')
                             ))
                             
-                            # 谷（遊脚期）
                             fig.add_trace(go.Scatter(
                                 x=raw_data['troughs'],
                                 y=[raw_data['smoothed_angles'][i] for i in raw_data['troughs']],
@@ -484,7 +469,6 @@ if uploaded_file is not None:
                                 marker=dict(color='red', size=10, symbol='circle')
                             ))
                             
-                            # 理想値ライン
                             fig.add_hline(y=175.0, line_dash="dash", line_color="green", 
                                         annotation_text="理想値: 175°", annotation_position="right")
                             fig.add_hline(y=165.0, line_dash="dash", line_color="orange",
@@ -494,6 +478,7 @@ if uploaded_file is not None:
                                 height=400,
                                 xaxis_title="フレーム番号",
                                 yaxis_title="膝関節角度（度）",
+                                yaxis=dict(range=[100, 190]),
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
                                 hovermode='x unified'
                             )
@@ -504,11 +489,9 @@ if uploaded_file is not None:
                             **グラフの見方:**
                             - 🟢 緑の星: 立脚期（膝伸展のピーク）
                             - 🔴 赤の丸: 遊脚期（膝屈曲）
-                            - 緑の破線: 理想値（175°）
-                            - オレンジの破線: リスク閾値（165°）
+                            - Y軸は100-190度に固定（比較しやすいように）
                             """)
                         
-                        # === データテーブル ===
                         with st.expander("📋 詳細データを確認"):
                             data_dict = {
                                 '指標': [
@@ -536,24 +519,21 @@ if uploaded_file is not None:
                             df = pd.DataFrame(data_dict)
                             st.dataframe(df, use_container_width=True)
                     
-                    else:  # simple分析
+                    else:
                         st.warning("⚠️ 歩行周期が検出できなかったため、簡易分析を表示")
                         max_angle = clinical_res.get('max_knee_angle', 0)
                         st.metric("最大膝伸展角度", f"{max_angle}°")
                         st.progress(min(max_angle / 180.0, 1.0))
                     
-                    # === 理学療法士からのアドバイス ===
                     st.markdown("---")
                     st.markdown("## 💬 理学療法士AIからのアドバイス")
                     
                     recommendations = clinical_res.get('recommendations', [])
                     
                     if recommendations:
-                        # Markdown表示
                         for rec in recommendations:
                             st.markdown(rec)
                     
-                    # === アクションボタン ===
                     st.markdown("---")
                     st.markdown("### 🎯 次のステップ")
                     
@@ -576,7 +556,6 @@ if uploaded_file is not None:
             else:
                 st.error(f"❌ 骨格データ不足: {len(landmarks_history)}フレーム（最低30フレーム必要）")
                 
-                # 臨床的アドバイス
                 st.markdown('<div class="clinical-advice-card">', unsafe_allow_html=True)
                 st.markdown("### 🩺 理学療法士からのアドバイス")
                 st.markdown("""
@@ -614,7 +593,6 @@ if uploaded_file is not None:
             pass
 
 else:
-    # 初期画面
     st.markdown("---")
     st.markdown("## 📖 AI歩行ドックの使い方")
     
@@ -651,7 +629,6 @@ else:
     st.markdown("---")
     st.info("💡 まずは上のボタンから歩行動画をアップロードしてください")
 
-# フッター
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #757575; padding: 2rem;'>
