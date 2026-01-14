@@ -2,4 +2,5 @@ streamlit
 mediapipe
 opencv-python
 numpy
-scipy  <-- これを追加！
+scipy 
+
