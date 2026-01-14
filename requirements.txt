@@ -1,7 +1,5 @@
 streamlit
-mediapipe==0.10.11
-opencv-python-headless
-numpy==1.26.4
-pandas
-plotly
-scipy
+mediapipe
+opencv-python
+numpy
+scipy  <-- これを追加！
