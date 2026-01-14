@@ -4,19 +4,27 @@ from scipy.interpolate import interp1d
 
 class FemaleGaitAnalyzer:
     def __init__(self):
-        # 臨床的な閾値（Sakane 2025モデル準拠）
+        # 臨床的な閾値（Sakane 2025モデル準拠）- 微調整版
         self.thresholds = {
-            'knee_extension_ideal': 175.0,
-            'knee_extension_minimum': 165.0,  # 立脚中期の最低基準
-            'stance_phase_mean_minimum': 170.0,  # 立脚期平均の理想値
-            'trunk_alignment_ideal': 5.0,  # 体幹傾斜の理想値（度）
-            'trunk_risk_threshold': 15.0,  # 体幹傾斜リスク閾値
+            'knee_extension_ideal': 175.0,      # 理想値（上方修正）
+            'knee_extension_good': 170.0,       # 良好の基準（新設）
+            'knee_extension_minimum': 165.0,    # 最低基準
+            'stance_phase_mean_minimum': 168.0, # 立脚期平均（170→168に緩和）
+            'trunk_alignment_ideal': 5.0,       # 体幹傾斜の理想値（度）
+            'trunk_risk_threshold': 15.0,       # 体幹傾斜リスク閾値
         }
         
         # 歩行周期検出のパラメータ
         self.gait_cycle_params = {
-            'min_peak_distance': 15,  # フレーム間の最小距離
-            'prominence': 5.0,  # ピーク検出の顕著性
+            'min_peak_distance': 15,
+            'prominence': 5.0,
+        }
+        
+        # 信頼度フィルタのパラメータ（新設）
+        self.confidence_params = {
+            'min_visibility': 0.7,              # 最低視認性閾値
+            'max_angle_change': 8.0,            # 1フレーム間の最大角度変化（度）
+            'noise_window': 5,                  # ノイズ平滑化ウィンドウ
         }
 
     def _calculate_angle(self, a, b, c):
@@ -25,6 +33,57 @@ class FemaleGaitAnalyzer:
         ba, bc = a - b, c - b
         cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
         return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
+
+    def _filter_by_confidence(self, angles, visibilities):
+        """
+        信頼度フィルタ：低信頼度フレームを補完・除外
+        
+        Parameters:
+        -----------
+        angles : list
+            角度のリスト
+        visibilities : list
+            各フレームの視認性スコアのリスト
+        
+        Returns:
+        --------
+        filtered_angles : np.ndarray
+            フィルタリング後の角度配列
+        """
+        if len(angles) != len(visibilities):
+            return np.array(angles)
+        
+        angles = np.array(angles)
+        visibilities = np.array(visibilities)
+        
+        # 1. 低信頼度フレームをマスク
+        valid_mask = visibilities >= self.confidence_params['min_visibility']
+        
+        if np.sum(valid_mask) < 10:  # 有効フレームが少なすぎる場合
+            return angles  # フィルタリングせずに返す
+        
+        # 2. 線形補間で低信頼度フレームを埋める
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) < len(angles):
+            interp_func = interp1d(
+                valid_indices, 
+                angles[valid_mask], 
+                kind='linear', 
+                fill_value='extrapolate'
+            )
+            all_indices = np.arange(len(angles))
+            angles = interp_func(all_indices)
+        
+        # 3. 急激な変化を検出して平滑化
+        angle_diffs = np.abs(np.diff(angles))
+        noise_mask = angle_diffs > self.confidence_params['max_angle_change']
+        
+        if np.any(noise_mask):
+            # ノイズが検出された場合、移動平均で平滑化
+            window = self.confidence_params['noise_window']
+            angles = np.convolve(angles, np.ones(window)/window, mode='same')
+        
+        return angles
 
     def _detect_gait_cycles(self, knee_angles):
         """
@@ -110,32 +169,76 @@ class FemaleGaitAnalyzer:
 
     def _calculate_trunk_alignment(self, landmarks_history):
         """
-        体幹の垂直性を評価（Sakane 2025モデル変数）
-        肩（SHOULDER）と股関節（HIP）の垂直からの傾斜角度を計算
+        体幹の垂直性を評価（修正版）
+        垂直線（0度）からの傾斜角度を計算
+        
+        理学療法士の視点：
+        - 垂直 = 0度
+        - 前傾 = 正の角度
+        - 後傾 = 負の角度（絶対値で評価）
         """
         trunk_angles = []
+        visibilities = []
         
         for lm in landmarks_history:
-            # 右側の肩(12)と股関節(24)を使用
-            shoulder = np.array([lm[12].x, lm[12].y])
-            hip = np.array([lm[24].x, lm[24].y])
-            
-            # 垂直線からの傾斜角度を計算
-            dx = shoulder[0] - hip[0]
-            dy = shoulder[1] - hip[1]
-            
-            # 垂直（90度）からの偏差
-            trunk_angle = np.abs(np.degrees(np.arctan2(dx, dy)))
-            trunk_angles.append(trunk_angle)
+            try:
+                # 右側の肩(12)と股関節(24)を使用
+                shoulder = np.array([lm[12].x, lm[12].y])
+                hip = np.array([lm[24].x, lm[24].y])
+                
+                # 視認性チェック
+                shoulder_vis = lm[12].visibility
+                hip_vis = lm[24].visibility
+                avg_vis = (shoulder_vis + hip_vis) / 2
+                
+                # 低信頼度フレームはスキップ
+                if avg_vis < 0.5:
+                    continue
+                
+                # 体幹ベクトル（肩→股関節）
+                trunk_vector = hip - shoulder
+                
+                # 垂直ベクトル（下向き = [0, 1]）
+                # MediaPipeのy座標は上が0、下が1なので、垂直下向きは[0, 1]
+                vertical_vector = np.array([0, 1])
+                
+                # 内積で角度を計算
+                dot_product = np.dot(trunk_vector, vertical_vector)
+                trunk_norm = np.linalg.norm(trunk_vector)
+                vertical_norm = np.linalg.norm(vertical_vector)
+                
+                cos_angle = dot_product / (trunk_norm * vertical_norm)
+                angle_rad = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+                
+                # ラジアンから度に変換
+                trunk_angle = np.degrees(angle_rad)
+                
+                # 前傾・後傾の判定（x座標の差で判断）
+                # 肩が股関節より前にある = 前傾 = 正の角度
+                # 肩が股関節より後ろ = 後傾 = 負の角度
+                if trunk_vector[0] > 0:  # 前傾
+                    pass  # そのまま
+                else:  # 後傾
+                    trunk_angle = -trunk_angle
+                
+                # 垂直からの絶対偏差を記録（評価用）
+                trunk_angles.append(np.abs(trunk_angle))
+                visibilities.append(avg_vis)
+                
+            except Exception as e:
+                continue
         
         if not trunk_angles:
             return None
         
+        # 信頼度フィルタを適用
+        filtered_trunk_angles = self._filter_by_confidence(trunk_angles, visibilities)
+        
         return {
-            'mean_trunk_angle': np.mean(trunk_angles),
-            'max_trunk_angle': np.max(trunk_angles),
-            'trunk_variability': np.std(trunk_angles),
-            'trunk_angles_series': trunk_angles
+            'mean_trunk_angle': np.mean(filtered_trunk_angles),
+            'max_trunk_angle': np.max(filtered_trunk_angles),
+            'trunk_variability': np.std(filtered_trunk_angles),
+            'trunk_angles_series': filtered_trunk_angles.tolist()
         }
 
     def _generate_clinical_recommendations(self, knee_metrics, trunk_metrics, gait_data):
@@ -146,7 +249,7 @@ class FemaleGaitAnalyzer:
         recs = []
         risk_level = "low"
         
-        # === 膝の評価 ===
+        # === 膝の評価（閾値微調整版） ===
         mean_stance = knee_metrics['mean_stance_extension']
         mean_peak = knee_metrics['mean_peak_extension']
         consistency = knee_metrics['consistency']
@@ -171,19 +274,28 @@ class FemaleGaitAnalyzer:
             recs.append("2. **歩行の意識改革**: 「かかと→小指球→親指球」の順で地面を押す感覚を意識")
             recs.append("3. **骨盤底筋トレーニング**: 立脚期に骨盤底を軽く引き上げる意識を持つ")
             
-        elif mean_stance < self.thresholds['knee_extension_ideal']:
+        elif mean_stance < self.thresholds['knee_extension_good']:
             risk_level = "moderate"
-            recs.append(f"**膝の伸びは良好ですが、さらなる改善の余地があります**  ")
-            recs.append(f"立脚期の平均膝伸展は{round(mean_stance, 1)}度（理想値: {self.thresholds['knee_extension_ideal']}度）")
+            recs.append(f"**膝の伸びは概ね良好です**  ")
+            recs.append(f"立脚期の平均膝伸展は{round(mean_stance, 1)}度（良好基準: {self.thresholds['knee_extension_good']}度以上）")
             recs.append("")
             recs.append("✨ **あと一歩で理想的な歩行へ**  ")
-            recs.append("現在の歩き方はとても良い状態です。あと少し膝の伸びを改善することで、以下のメリットが得られます：")
+            recs.append("現在の歩き方は良い状態です。あと少し膝の伸びを改善することで、以下のメリットが得られます：")
             recs.append("- 長時間歩いても疲れにくい身体")
             recs.append("- 夕方の下半身のむくみ軽減")
             recs.append("- 骨盤底筋の機能維持")
             recs.append("")
             recs.append("🎯 **ワンランク上の歩行へ**  ")
             recs.append("通勤時に「胸を開いて、遠くを見て歩く」ことを意識してみてください。視線が上がると自然と体幹が安定し、膝も伸びやすくなります。")
+            
+        elif mean_stance < self.thresholds['knee_extension_ideal']:
+            risk_level = "low"
+            recs.append(f"**膝の伸びは良好です！**  ")
+            recs.append(f"立脚期の平均膝伸展は{round(mean_stance, 1)}度。とても良い状態です。")
+            recs.append("")
+            recs.append("🌟 **理想値まであと少し**  ")
+            recs.append(f"理想値の{self.thresholds['knee_extension_ideal']}度まであと{round(self.thresholds['knee_extension_ideal'] - mean_stance, 1)}度です。")
+            recs.append("現在の状態を維持しながら、股関節の柔軟性を高めることで、さらに向上します。")
             
         else:
             recs.append(f"**✨ 理想的な膝の伸びです！**  ")
@@ -207,7 +319,7 @@ class FemaleGaitAnalyzer:
         else:
             recs.append("✅ **歩行の一貫性**: 素晴らしいです。各歩行周期で安定した動きができています。")
         
-        # === 体幹の評価 ===
+        # === 体幹の評価（修正版） ===
         if trunk_metrics:
             recs.append("")
             recs.append("### 🧘‍♀️ 体幹の評価（Sakane 2025モデル）")
@@ -255,11 +367,7 @@ class FemaleGaitAnalyzer:
 
     def analyze_clinical_data(self, landmarks_history):
         """
-        臨床データの総合分析
-        - 歩行周期の検出
-        - 立脚期の平均評価
-        - 体幹アライメント評価
-        - 臨床的フィードバック生成
+        臨床データの総合分析（信頼度フィルタ統合版）
         """
         if not landmarks_history or len(landmarks_history) < 30:
             return {
@@ -267,20 +375,29 @@ class FemaleGaitAnalyzer:
                 'message': '歩行分析には最低1秒間（約30フレーム）の動画が必要です。'
             }
         
-        # 1. 膝角度の時系列データ抽出
+        # 1. 膝角度の時系列データ抽出（視認性付き）
         knee_angles = []
+        knee_visibilities = []
+        
         for lm in landmarks_history:
             try:
                 hip = [lm[24].x, lm[24].y]
                 knee = [lm[26].x, lm[26].y]
                 ankle = [lm[28].x, lm[28].y]
                 
-                # Visibility チェック
-                if lm[24].visibility < 0.5 or lm[26].visibility < 0.5 or lm[28].visibility < 0.5:
+                # Visibility取得
+                hip_vis = lm[24].visibility
+                knee_vis = lm[26].visibility
+                ankle_vis = lm[28].visibility
+                avg_vis = (hip_vis + knee_vis + ankle_vis) / 3
+                
+                # 最低限のVisibilityチェック（0.5以上）
+                if avg_vis < 0.5:
                     continue
                     
                 angle = self._calculate_angle(hip, knee, ankle)
                 knee_angles.append(angle)
+                knee_visibilities.append(avg_vis)
             except:
                 continue
         
@@ -290,12 +407,15 @@ class FemaleGaitAnalyzer:
                 'message': '膝・股関節・足首のランドマークが十分に検出できませんでした。'
             }
         
+        # 信頼度フィルタを適用
+        filtered_knee_angles = self._filter_by_confidence(knee_angles, knee_visibilities)
+        
         # 2. 歩行周期の検出
-        gait_data = self._detect_gait_cycles(knee_angles)
+        gait_data = self._detect_gait_cycles(filtered_knee_angles)
         
         if not gait_data or len(gait_data['cycles']) == 0:
             # フォールバック: 単純な最大値評価
-            max_extension = max(knee_angles)
+            max_extension = max(filtered_knee_angles)
             return {
                 'max_knee_angle': round(max_extension, 1),
                 'analysis_type': 'simple',
@@ -312,7 +432,7 @@ class FemaleGaitAnalyzer:
         # 3. 立脚期メトリクスの計算
         knee_metrics = self._calculate_stance_phase_metrics(gait_data)
         
-        # 4. 体幹アライメントの評価
+        # 4. 体幹アライメントの評価（修正版）
         trunk_metrics = self._calculate_trunk_alignment(landmarks_history)
         
         # 5. 臨床的フィードバック生成
@@ -328,7 +448,7 @@ class FemaleGaitAnalyzer:
                 'mean_stance_extension': round(knee_metrics['mean_stance_extension'], 1),
                 'mean_peak_extension': round(knee_metrics['mean_peak_extension'], 1),
                 'consistency': round(knee_metrics['consistency'], 1),
-                'max_knee_angle': round(knee_metrics['mean_peak_extension'], 1)  # 後方互換性
+                'max_knee_angle': round(knee_metrics['mean_peak_extension'], 1)
             },
             'trunk_metrics': {
                 'mean_trunk_angle': round(trunk_metrics['mean_trunk_angle'], 1) if trunk_metrics else None,
@@ -337,7 +457,7 @@ class FemaleGaitAnalyzer:
             'risk_level': risk_level,
             'recommendations': recommendations,
             'raw_data': {
-                'knee_angles_series': knee_angles,
+                'knee_angles_series': filtered_knee_angles.tolist(),
                 'smoothed_angles': gait_data['smoothed_angles'].tolist(),
                 'peaks': gait_data['peaks'].tolist(),
                 'troughs': gait_data['troughs'].tolist()
@@ -345,10 +465,7 @@ class FemaleGaitAnalyzer:
         }
 
     def export_for_sakane_model(self, analysis_result):
-        """
-        Sakane 2025モデル用の変数セットをエクスポート
-        将来の多変量解析に備えた拡張性
-        """
+        """Sakane 2025モデル用の変数セットをエクスポート"""
         if analysis_result.get('analysis_type') != 'advanced':
             return None
         
@@ -356,9 +473,8 @@ class FemaleGaitAnalyzer:
             'variable_1_knee_extension': analysis_result['knee_metrics']['mean_stance_extension'],
             'variable_2_trunk_alignment': analysis_result['trunk_metrics']['mean_trunk_angle'] if analysis_result['trunk_metrics'] else None,
             'variable_3_gait_consistency': analysis_result['knee_metrics']['consistency'],
-            # 将来追加予定の変数
-            'variable_4_step_length': None,  # TODO: 実装予定
-            'variable_5_cadence': None,  # TODO: 実装予定
+            'variable_4_step_length': None,
+            'variable_5_cadence': None,
             'analysis_timestamp': np.datetime64('now'),
-            'model_version': 'Sakane2025_v1.0'
+            'model_version': 'Sakane2025_v1.1_confidence_filter'
         }
