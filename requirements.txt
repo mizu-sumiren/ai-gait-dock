@@ -1,6 +1,7 @@
 streamlit
 mediapipe
-opencv-python
+opencv-python-headless
 numpy
-scipy 
-
+scipy
+pandas
+plotly
