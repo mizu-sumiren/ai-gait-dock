@@ -1,643 +1,150 @@
-import streamlit as st
-import cv2
-import numpy as np
-import tempfile
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+"""AI歩行ドック — 歩き方の記録と、前回からの変化の見える化（画面）"""
+import datetime
+import math
 import os
+import tempfile
 
-# MediaPipeの堅牢なインポート
-try:
-    import mediapipe as mp
-    mp_pose = mp.solutions.pose
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
-    MEDIAPIPE_AVAILABLE = True
-except (ImportError, AttributeError) as e:
-    st.error(f"MediaPipeのインポートに失敗しました: {e}")
-    MEDIAPIPE_AVAILABLE = False
+import pandas as pd
+import streamlit as st
 
-# FemaleGaitAnalyzerのインポート
-try:
-    from female_gait_analyzer import FemaleGaitAnalyzer
-except ImportError:
-    st.error("female_gait_analyzer.py が見つかりません。同じディレクトリに配置してください。")
-    st.stop()
+from gait.analysis import GaitResult, analyze
+from gait.reference import REFERENCES
 
-# ページ設定
-st.set_page_config(
-    page_title="AI歩行ドック フェーズ3",
-    page_icon="🚺",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="AI歩行ドック", page_icon="🚶", layout="centered")
 
-# カスタムCSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.8rem;
-        font-weight: bold;
-        background: linear-gradient(135deg, #E91E63 0%, #F06292 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        margin-bottom: 0.5rem;
-        padding: 1rem 0;
-    }
-    
-    .sub-header {
-        font-size: 1.3rem;
-        color: #757575;
-        text-align: center;
-        margin-bottom: 2rem;
-        font-weight: 300;
-    }
-    
-    .success-card {
-        background: linear-gradient(135deg, #E8F5E9 0%, #F1F8E9 100%);
-        border-left: 6px solid #4CAF50;
-        padding: 1.8rem;
-        border-radius: 12px;
-        margin: 1.2rem 0;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-    }
-    
-    .warning-card {
-        background: linear-gradient(135deg, #FFF8E1 0%, #FFECB3 100%);
-        border-left: 6px solid #FFC107;
-        padding: 1.8rem;
-        border-radius: 12px;
-        margin: 1.2rem 0;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-    }
-    
-    .danger-card {
-        background: linear-gradient(135deg, #FFEBEE 0%, #FFCDD2 100%);
-        border-left: 6px solid #F44336;
-        padding: 1.8rem;
-        border-radius: 12px;
-        margin: 1.2rem 0;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-    }
-    
-    .clinical-advice-card {
-        background: linear-gradient(135deg, #E91E63 0%, #F06292 100%);
-        color: white;
-        padding: 2rem;
-        border-radius: 16px;
-        margin: 1.5rem 0;
-        box-shadow: 0 6px 20px rgba(233, 30, 99, 0.3);
-    }
-    
-    .info-card {
-        background: linear-gradient(135deg, #E3F2FD 0%, #BBDEFB 100%);
-        border-left: 6px solid #2196F3;
-        padding: 1.8rem;
-        border-radius: 12px;
-        margin: 1.2rem 0;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-    }
-    
-    .stProgress > div > div > div > div {
-        background: linear-gradient(90deg, #E91E63 0%, #F06292 100%);
-    }
-    
-    div[data-testid="stMetricValue"] {
-        font-size: 2rem;
-        font-weight: bold;
-        color: #E91E63;
-    }
-    
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #FCE4EC 0%, #F8BBD0 100%);
-    }
-    
-    .stButton > button {
-        background: linear-gradient(135deg, #E91E63 0%, #F06292 100%);
-        color: white;
-        border: none;
-        border-radius: 8px;
-        padding: 0.6rem 1.5rem;
-        font-weight: 600;
-        box-shadow: 0 4px 12px rgba(233, 30, 99, 0.3);
-        transition: all 0.3s ease;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 16px rgba(233, 30, 99, 0.4);
-    }
-    
-    div[data-testid="stFileUploader"] {
-        background-color: #FFF;
-        border: 2px dashed #E91E63;
-        border-radius: 12px;
-        padding: 2rem;
-    }
-</style>
-""", unsafe_allow_html=True)
+MIN_STRIDES = REFERENCES["min_strides"]["value"]
 
-# 画像前処理関数（CLAHE強化版）
-def enhance_frame_for_pose_detection(frame):
-    """CLAHE強化版：より強力なコントラスト強調"""
+# 表示する指標: (キー, ラベル, 単位, 小数桁, 対象の撮り方)
+METRICS = [
+    ("speed_m_s", "歩行速度（手計測）", "m/秒", 2, ("side", "front")),
+    ("cadence_spm", "歩行率", "歩/分", 0, ("side", "front")),
+    ("stride_time_s", "ストライド時間", "秒", 2, ("side", "front")),
+    ("stride_time_cv_pct", "ストライド時間のばらつき (CV)", "%", 1, ("side", "front")),
+    ("stride_length_m", "ストライド長（速度×時間）", "m", 2, ("side", "front")),
+    ("trunk_lean_deg", "体幹の前傾（参考）", "°", 1, ("side",)),
+    ("midstance_knee_flexion_deg", "立脚中期の膝の曲がり（参考）", "°", 1, ("side",)),
+]
+
+
+def _ok(v):
+    return isinstance(v, (int, float)) and not math.isnan(v)
+
+
+def render_result(res: GaitResult, prev: dict | None = None):
+    """結果の表示。判定や色分けはせず、今回の値と前回との差だけを出す。"""
+    for m in res.messages:
+        st.warning(m)
+
+    st.caption(f"骨格の検出率 {res.detection_rate * 100:.0f}% ・ 動画 {res.fps:.0f}fps ・ "
+               f"解析に使えた歩数 {res.n_steps}歩")
+    if res.detection_rate < 0.7:
+        st.info("検出率がやや低めです。明るい場所で、服と背景の色が違うと検出しやすくなります。")
+
+    shown = [m for m in METRICS if res.view in m[4] and _ok(getattr(res, m[0]))]
+    cols = st.columns(2)
+    for i, (key, label, unit, nd, _) in enumerate(shown):
+        val = getattr(res, key)
+        delta = None
+        if prev and _ok(prev.get(key)):
+            delta = f"{val - prev[key]:+.{nd}f} {unit}（前回比）"
+        cols[i % 2].metric(label, f"{val:.{nd}f} {unit}", delta, delta_color="off")
+
+    walked_strides = res.n_steps // 2
+    if _ok(res.stride_time_cv_pct):
+        if walked_strides < MIN_STRIDES:
+            st.info(f"今回のばらつき(CV)は約{walked_strides}ストライド分からの値です。"
+                    f"{REFERENCES['min_strides']['note']}"
+                    "少なめのときは、参考程度にご覧ください。")
+        if res.fps < 50:
+            st.info("30fpsの動画は時間の目盛りが粗いため、ばらつき(CV)が実際より大きめに出ることがあります。"
+                    "60fps以上での撮影がおすすめです。")
+    if res.n_rejected_steps:
+        st.caption(f"タイミングが大きく外れた {res.n_rejected_steps} 歩は、検出ミスの可能性があるため除いています。")
+    if res.view == "side" and _ok(res.midstance_knee_flexion_deg):
+        side = "左" if res.near_side == "left" else "右"
+        st.caption(f"膝はカメラ側（{side}脚）の値です（{res.n_midstance}回の平均）。0°がまっすぐで、反張膝は区別できません。")
+
+    with st.expander("数値の見方と出典"):
+        st.markdown(
+            "- この結果は**診断やリスクの判定ではなく、歩き方の記録**です。"
+            "同じ場所・同じ撮り方で撮った前回の結果と比べてご覧ください。\n"
+            f"- {REFERENCES['stride_time_cv']['note']}\n  - 出典: {REFERENCES['stride_time_cv']['source']}\n"
+            f"- {REFERENCES['pose_accuracy']['note']}\n  - 出典: {REFERENCES['pose_accuracy']['source']}\n"
+            f"- {REFERENCES['workers_gait']['note']}\n  - 出典: {REFERENCES['workers_gait']['source']}\n"
+            "- 体幹の前傾と膝の曲がりは、腰痛との関係がはっきり示されている指標ではありません。"
+            "姿勢に気づくきっかけとしてお使いください。"
+        )
+
+
+def result_csv(res: GaitResult) -> bytes:
+    row = {"date": datetime.date.today().isoformat(), **res.to_row()}
+    return pd.DataFrame([row]).to_csv(index=False).encode("utf-8-sig")
+
+
+def load_previous(file) -> dict | None:
     try:
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))
-        l_enhanced = clahe.apply(l)
-        
-        lab_enhanced = cv2.merge([l_enhanced, a, b])
-        enhanced_frame = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
-        
-        kernel = np.array([[0, -1, 0], [-1, 5.5, -1], [0, -1, 0]])
-        sharpened = cv2.filter2D(enhanced_frame, -1, kernel)
-        enhanced_frame = cv2.addWeighted(enhanced_frame, 0.6, sharpened, 0.4, 0)
-        
-        mean_brightness = np.mean(enhanced_frame)
-        if mean_brightness < 110:
-            gamma = 1.3
-            inv_gamma = 1.0 / gamma
-            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-            enhanced_frame = cv2.LUT(enhanced_frame, table)
-        
-        return enhanced_frame
-    except:
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        df = pd.read_csv(file)
+        return df.iloc[-1].to_dict() if len(df) else None
+    except Exception:
+        st.warning("前回のCSVを読み込めませんでした。このアプリで保存したCSVをお選びください。")
+        return None
 
-# ヘッダー
-st.markdown('<p class="main-header">🚺 AI歩行ドック：フェーズ3</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">理学療法士の視点を組み込んだ、あなたのための歩行分析システム</p>', unsafe_allow_html=True)
 
-# サイドバー
-with st.sidebar:
-    st.markdown("### 🩺 AI歩行ドックとは")
-    st.write("""
-    理学療法士の臨床知識とAI技術を融合させた、
-    働く女性のための歩行分析システムです。
-    
-    **✨ 主な機能:**
-    - 歩行周期の自動検出
-    - 立脚期の詳細分析
-    - 体幹アライメント評価
-    - 骨盤底筋リスク評価
-    - CLAHE画像強化技術
-    """)
-    
-    st.markdown("---")
-    st.markdown("### 🎥 撮影のコツ")
-    st.write("""
-    **📸 推奨条件:**
-    - 明るい自然光の部屋
-    - 単色の背景（壁）
-    - 服装と背景のコントラスト
-    - 完全に横からのアングル
-    - 2-5歩程度の自然な歩行
-    
-    **⚠️ 避けるべき:**
-    - 白背景×白い服
-    - 暗い環境・逆光
-    - 斜めからの撮影
-    """)
-    
-    st.markdown("---")
-    st.caption("💖 Developed by すみれん")
-    st.caption("理学療法士 × AI Engineer")
+def main():
+    st.title("🚶 AI歩行ドック")
+    st.write("スマホで撮った歩行動画から、歩き方を数値で記録します。前回の結果と並べて、変化を確認できます。")
 
-# MediaPipe利用可能性チェック
-if not MEDIAPIPE_AVAILABLE:
-    st.error("⚠️ MediaPipeが正しくインストールされていません。")
-    st.stop()
+    with st.expander("📷 撮り方のコツ", expanded=False):
+        st.markdown(
+            "- スマホは**横向き**で、三脚などに**固定**します\n"
+            "- できれば **60fps** で撮影します（iPhoneは 設定→カメラ→ビデオ撮影）\n"
+            "- 全身が映るようにして、明るい場所で撮ります\n"
+            "- **正面**：廊下の端にスマホを置き、5〜10mを2〜3往復（リズムのばらつきを見る）\n"
+            "- **側面**：真横から3〜4m離して、前を横切るように歩く（体幹・膝の参考値）\n"
+            "- 歩行速度は、床に目印を2つ置いて（例：5m）ストップウォッチで測った値を入力します"
+        )
 
-# ファイルアップローダー
-st.markdown("### 📹 歩行動画のアップロード")
-uploaded_file = st.file_uploader(
-    "横から撮影した歩行動画をアップロードしてください",
-    type=['mp4', 'mov', 'avi'],
-    help="スマートフォンで横向きに撮影した動画が最適です"
-)
+    view_label = st.radio("撮った向き", ["正面（前から）", "側面（横から）"], horizontal=True)
+    view = "front" if view_label.startswith("正面") else "side"
 
-if uploaded_file is not None:
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
-        tfile.write(uploaded_file.read())
-        temp_video_path = tfile.name
-    
-    try:
-        cap = cv2.VideoCapture(temp_video_path)
-        
-        if not cap.isOpened():
-            st.error("❌ 動画ファイルを開けませんでした。")
-            st.stop()
-        
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        
-        if total_frames == 0:
-            st.error("❌ 動画フレーム数が0です。")
-            cap.release()
-            st.stop()
-        
-        with mp_pose.Pose(
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-            model_complexity=1,
-            smooth_landmarks=True
-        ) as pose:
-            
-            landmarks_history = []
-            frame_count = 0
-            detection_count = 0
-            
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                st_frame = st.empty()
-            with col2:
-                st.markdown("#### 📊 処理状況")
-                frame_info = st.empty()
-                landmark_info = st.empty()
-                detection_rate_display = st.empty()
-            
-            status_text.info("🔍 AI理学療法士が動画を解析中...")
-            
-            DISPLAY_INTERVAL = 10
-            PREVIEW_WIDTH = 640
-            
-            while cap.isOpened():
-                ret, frame = cap.read()
-                
-                if not ret or frame is None:
-                    break
-                
-                if frame.size == 0:
-                    continue
-                
-                frame_count += 1
-                progress = frame_count / total_frames if total_frames > 0 else 0
-                progress_bar.progress(min(progress, 1.0))
-                
-                try:
-                    frame_enhanced = enhance_frame_for_pose_detection(frame)
-                    results = pose.process(frame_enhanced)
-                    
-                    if results.pose_landmarks:
-                        landmarks_history.append(results.pose_landmarks.landmark)
-                        detection_count += 1
-                        
-                        mp_drawing.draw_landmarks(
-                            frame,
-                            results.pose_landmarks,
-                            mp_pose.POSE_CONNECTIONS,
-                            landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
-                        )
-                        
-                        current_detection_rate = (detection_count / frame_count) * 100
-                        landmark_info.success(f"✅ 骨格検出: {len(landmarks_history)} フレーム")
-                        detection_rate_display.metric(
-                            "検出成功率",
-                            f"{current_detection_rate:.1f}%",
-                            delta=f"{detection_count}/{frame_count}"
-                        )
-                    else:
-                        current_detection_rate = (detection_count / frame_count) * 100
-                        landmark_info.warning("⚠️ 骨格未検出")
-                        detection_rate_display.metric(
-                            "検出成功率",
-                            f"{current_detection_rate:.1f}%",
-                            delta=f"{detection_count}/{frame_count}"
-                        )
-                    
-                    frame_info.metric("処理フレーム", f"{frame_count}/{total_frames}")
-                    
-                    if frame_count % DISPLAY_INTERVAL == 0:
-                        height, width = frame.shape[:2]
-                        if width > PREVIEW_WIDTH:
-                            scale = PREVIEW_WIDTH / width
-                            new_width = PREVIEW_WIDTH
-                            new_height = int(height * scale)
-                            frame_resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                        else:
-                            frame_resized = frame
-                        
-                        try:
-                            st_frame.image(frame_resized, channels="BGR", use_container_width=True)
-                        except:
-                            pass
-                
-                except:
-                    continue
-            
+    c1, c2 = st.columns(2)
+    distance = c1.number_input("歩いた距離（m・任意）", min_value=0.0, max_value=50.0, value=0.0, step=0.5)
+    seconds = c2.number_input("かかった時間（秒・任意）", min_value=0.0, max_value=120.0, value=0.0, step=0.1)
+
+    video = st.file_uploader("歩行動画", type=["mp4", "mov", "m4v", "avi"])
+    prev_file = st.file_uploader("前回の結果CSV（任意・比べたいとき）", type=["csv"])
+
+    if video is not None:
+        key = (video.name, video.size, view)
+        if st.session_state.get("pose_key") != key:      # 同じ動画は再解析しない
+            suffix = os.path.splitext(video.name)[1] or ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+                f.write(video.getbuffer())
+                path = f.name
             try:
-                if frame is not None and frame.size > 0:
-                    height, width = frame.shape[:2]
-                    if width > PREVIEW_WIDTH:
-                        scale = PREVIEW_WIDTH / width
-                        frame_resized = cv2.resize(frame, (PREVIEW_WIDTH, int(height * scale)), interpolation=cv2.INTER_AREA)
-                    else:
-                        frame_resized = frame
-                    st_frame.image(frame_resized, channels="BGR", use_container_width=True)
-            except:
-                pass
-            
-            cap.release()
-            
-            final_detection_rate = detection_count / total_frames if total_frames > 0 else 0
-            status_text.success(f"✅ 処理完了: {len(landmarks_history)}フレーム検出（検出率: {final_detection_rate*100:.1f}%）")
-            
-            if len(landmarks_history) >= 30:
-                st.markdown("---")
-                status_text.info("🧠 AI理学療法士が詳細分析中...")
-                
-                with st.spinner("歩行パターンを解析しています..."):
-                    analyzer = FemaleGaitAnalyzer()
-                    clinical_res = analyzer.analyze_clinical_data(landmarks_history)
-                
-                if clinical_res.get('error'):
-                    st.error(f"❌ {clinical_res['error']}: {clinical_res['message']}")
-                else:
-                    status_text.success("✨ 分析完了！")
-                    
-                    st.markdown("---")
-                    st.markdown("## 🏥 AI理学療法士の臨床分析レポート")
-                    
-                    # リスクレベルバッジ
-                    risk_level = clinical_res.get('risk_level', 'unknown')
-                    risk_badges = {
-                        'critical': ('🚨 要専門家相談（Critical Risk）', 'danger-card'),
-                        'high': ('🔔 改善推奨（High Risk）', 'danger-card'),
-                        'moderate': ('💚 良好（Moderate）', 'warning-card'),
-                        'low': ('🌟 優良（Excellent）', 'success-card')
-                    }
-                    badge_text, card_class = risk_badges.get(risk_level, ('❓ 不明', 'info-card'))
-                    st.markdown(f'<div class="{card_class}"><h2 style="margin:0;">{badge_text}</h2></div>', unsafe_allow_html=True)
-                    
-                    if clinical_res.get('analysis_type') == 'advanced':
-                        st.markdown("### 📊 主要な臨床指標")
-                        
-                        knee_metrics = clinical_res['knee_metrics']
-                        trunk_metrics = clinical_res.get('trunk_metrics')
-                        
-                        col1, col2, col3 = st.columns(3)
-                        
-                        with col1:
-                            stance_ext = knee_metrics['mean_stance_extension']
-                            delta_knee = stance_ext - 175.0
-                            st.metric(
-                                "立脚期 平均膝伸展",
-                                f"{stance_ext}°",
-                                f"{delta_knee:+.1f}° (理想値との差)",
-                                delta_color="normal" if delta_knee >= 0 else "inverse"
-                            )
-                            progress_val = min(stance_ext / 180.0, 1.0)
-                            st.progress(progress_val)
-                            st.caption("理想値: 175°以上")
-                        
-                        with col2:
-                            consistency = knee_metrics['consistency']
-                            consistency_interp = knee_metrics.get('consistency_interpretation', {})
-                            
-                            st.metric(
-                                "歩行リズムの安定度",
-                                f"±{consistency}°",
-                                consistency_interp.get('label', ''),
-                                delta_color="normal" if consistency < 5.0 else "inverse"
-                            )
-                            
-                            if consistency_interp:
-                                icon = consistency_interp.get('icon', '')
-                                st.markdown(f"### {icon}")
-                            
-                            st.caption("SD値が小さいほど安定")
-                        
-                        with col3:
-                            if trunk_metrics and trunk_metrics['mean_trunk_angle'] is not None:
-                                trunk_angle = trunk_metrics['mean_trunk_angle']
-                                delta_trunk = trunk_angle - 5.0
-                                st.metric(
-                                    "体幹傾斜角度",
-                                    f"{trunk_angle}°",
-                                    f"{delta_trunk:+.1f}° (理想値との差)",
-                                    delta_color="normal" if delta_trunk <= 0 else "inverse"
-                                )
-                                st.caption("理想値: 5°以下")
-                            else:
-                                st.metric("体幹傾斜角度", "測定不可", "データ不足")
-                        
-                        st.info(f"🚶‍♀️ 検出された歩行周期: **{clinical_res['gait_cycles_detected']}周期**")
-                        
-                        # 歩行波形グラフ（Y軸固定版）
-                        st.markdown("### 📈 歩行パターンの可視化")
-                        
-                        raw_data = clinical_res.get('raw_data', {})
-                        if raw_data:
-                            fig = go.Figure()
-                            
-                            fig.add_trace(go.Scatter(
-                                y=raw_data['knee_angles_series'],
-                                mode='lines',
-                                name='生データ',
-                                line=dict(color='lightblue', width=1),
-                                opacity=0.5
-                            ))
-                            
-                            fig.add_trace(go.Scatter(
-                                y=raw_data['smoothed_angles'],
-                                mode='lines',
-                                name='平滑化データ',
-                                line=dict(color='#E91E63', width=2)
-                            ))
-                            
-                            fig.add_trace(go.Scatter(
-                                x=raw_data['peaks'],
-                                y=[raw_data['smoothed_angles'][i] for i in raw_data['peaks']],
-                                mode='markers',
-                                name='立脚期（膝伸展）',
-                                marker=dict(color='green', size=10, symbol='star')
-                            ))
-                            
-                            fig.add_trace(go.Scatter(
-                                x=raw_data['troughs'],
-                                y=[raw_data['smoothed_angles'][i] for i in raw_data['troughs']],
-                                mode='markers',
-                                name='遊脚期（膝屈曲）',
-                                marker=dict(color='red', size=10, symbol='circle')
-                            ))
-                            
-                            fig.add_hline(y=175.0, line_dash="dash", line_color="green", 
-                                        annotation_text="理想値: 175°", annotation_position="right")
-                            fig.add_hline(y=165.0, line_dash="dash", line_color="orange",
-                                        annotation_text="リスク閾値: 165°", annotation_position="right")
-                            
-                            fig.update_layout(
-                                height=400,
-                                xaxis_title="フレーム番号",
-                                yaxis_title="膝関節角度（度）",
-                                yaxis=dict(range=[100, 190]),
-                                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                                hovermode='x unified'
-                            )
-                            
-                            st.plotly_chart(fig, use_container_width=True)
-                            
-                            st.caption("""
-                            **グラフの見方:**
-                            - 🟢 緑の星: 立脚期（膝伸展のピーク）
-                            - 🔴 赤の丸: 遊脚期（膝屈曲）
-                            - Y軸は100-190度に固定（比較しやすいように）
-                            """)
-                        
-                        with st.expander("📋 詳細データを確認"):
-                            data_dict = {
-                                '指標': [
-                                    '立脚期平均膝伸展',
-                                    '最大膝伸展',
-                                    '歩行の一貫性（SD）',
-                                    '体幹傾斜角度',
-                                    '検出歩行周期数'
-                                ],
-                                '測定値': [
-                                    f"{knee_metrics['mean_stance_extension']}°",
-                                    f"{knee_metrics['mean_peak_extension']}°",
-                                    f"±{knee_metrics['consistency']}°",
-                                    f"{trunk_metrics['mean_trunk_angle']}°" if trunk_metrics else "N/A",
-                                    f"{clinical_res['gait_cycles_detected']}周期"
-                                ],
-                                '評価基準': [
-                                    '175°以上が理想',
-                                    '180°に近いほど良好',
-                                    '5°以下が安定',
-                                    '5°以下が理想',
-                                    '3周期以上で信頼性向上'
-                                ]
-                            }
-                            df = pd.DataFrame(data_dict)
-                            st.dataframe(df, use_container_width=True)
-                    
-                    else:
-                        st.warning("⚠️ 歩行周期が検出できなかったため、簡易分析を表示")
-                        max_angle = clinical_res.get('max_knee_angle', 0)
-                        st.metric("最大膝伸展角度", f"{max_angle}°")
-                        st.progress(min(max_angle / 180.0, 1.0))
-                    
-                    st.markdown("---")
-                    st.markdown("## 💬 理学療法士AIからのアドバイス")
-                    
-                    recommendations = clinical_res.get('recommendations', [])
-                    
-                    if recommendations:
-                        for rec in recommendations:
-                            st.markdown(rec)
-                    
-                    st.markdown("---")
-                    st.markdown("### 🎯 次のステップ")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        if st.button("📊 Sakane 2025データ", use_container_width=True):
-                            sakane_data = analyzer.export_for_sakane_model(clinical_res)
-                            if sakane_data:
-                                st.json(sakane_data)
-                    
-                    with col2:
-                        if st.button("📥 レポート保存", use_container_width=True):
-                            st.info("PDF出力機能は次回実装予定")
-                    
-                    with col3:
-                        if st.button("🔄 別の動画を分析", use_container_width=True):
-                            st.rerun()
-            
-            else:
-                st.error(f"❌ 骨格データ不足: {len(landmarks_history)}フレーム（最低30フレーム必要）")
-                
-                st.markdown('<div class="clinical-advice-card">', unsafe_allow_html=True)
-                st.markdown("### 🩺 理学療法士からのアドバイス")
-                st.markdown("""
-                **現在の状況:**  
-                動画から十分な骨格データを取得できませんでした。
-                
-                **考えられる原因:**
-                1. **背景と服装の色が似ている**（白背景×白服など）
-                2. **照明が不十分**（暗い環境・逆光）
-                3. **撮影アングルの問題**（斜めから・身体が切れている）
-                
-                **すぐにできる対策:**
-                - ✅ 濃い色のカーディガンを羽織る
-                - ✅ 部屋の照明をすべて点ける
-                - ✅ 白い壁の前なら黒や紺の服装に
-                - ✅ スマホを三脚で真横に固定
-                
-                正確な歩行分析には、AIがあなたの動きを継続的に追跡できることが重要です。
-                検出率70%以上を目指して、再撮影をお試しください。
-                """)
-                st.markdown('</div>', unsafe_allow_html=True)
-    
-    except Exception as e:
-        st.error(f"❌ エラーが発生: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
-    
-    finally:
-        try:
-            if 'cap' in locals():
-                cap.release()
-            if os.path.exists(temp_video_path):
-                os.unlink(temp_video_path)
-        except:
-            pass
+                from gait.pose import extract_pose       # MediaPipe は解析時にだけ読み込む
+                bar = st.progress(0.0, text="動画を解析しています…")
+                pose = extract_pose(path, progress=lambda p: bar.progress(p, text="動画を解析しています…"))
+                bar.empty()
+                st.session_state["pose"], st.session_state["pose_key"] = pose, key
+            except Exception as e:
+                st.error(f"動画の解析でエラーが起きました: {e}")
+                return
+            finally:
+                if os.path.exists(path):
+                    os.unlink(path)
 
-else:
-    st.markdown("---")
-    st.markdown("## 📖 AI歩行ドックの使い方")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("""
-        ### 1️⃣ 動画を撮影
-        - 横から全身が映るように
-        - 2-5歩程度歩く
-        - 自然な歩き方で
-        - 明るい場所で撮影
-        - **背景と服装のコントラスト重要**
-        """)
-    
-    with col2:
-        st.markdown("""
-        ### 2️⃣ 動画をアップロード
-        - 上のボタンから選択
-        - mp4, mov, avi対応
-        - iPhone/Android対応
-        - CLAHE画像強化で自動処理
-        """)
-    
-    with col3:
-        st.markdown("""
-        ### 3️⃣ 結果を確認
-        - AI理学療法士が分析
-        - 詳細なアドバイス
-        - Plotlyグラフで可視化
-        - Sakane 2025モデル準拠
-        """)
-    
-    st.markdown("---")
-    st.info("💡 まずは上のボタンから歩行動画をアップロードしてください")
+        res = analyze(st.session_state["pose"], view, distance_m=distance, time_s=seconds)
+        prev = load_previous(prev_file) if prev_file is not None else None
+        st.subheader("今回の結果")
+        render_result(res, prev)
+        st.download_button("📥 結果をCSVで保存（次回の比較用）", result_csv(res),
+                           file_name=f"gait_{view}_{datetime.date.today().isoformat()}.csv", mime="text/csv")
 
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #757575; padding: 2rem;'>
-    <p style='font-size: 1.2rem; font-weight: bold; color: #E91E63;'>AI歩行ドック フェーズ3</p>
-    <p>Powered by MediaPipe × CLAHE × 理学療法士の臨床知識</p>
-    <p>Developed by すみれん | Physical Therapist × AI Engineer</p>
-    <p style='font-size: 0.8rem; margin-top: 1rem; color: #999;'>
-        ⚠️ 本システムは医療診断を目的としたものではありません。<br>
-        気になる症状がある場合は、医療機関を受診してください。
-    </p>
-</div>
-""", unsafe_allow_html=True)
+    st.divider()
+    st.caption("本アプリは医療機器ではなく、診断を目的としたものではありません。"
+               "痛みや気になる症状があるときは、医療機関にご相談ください。")
+
+
+if __name__ == "__main__":
+    main()
